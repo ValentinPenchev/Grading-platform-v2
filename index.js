@@ -8,39 +8,54 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Връзка със Supabase чрез променливите от средата в Render
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-
-// Настройка на multer за временно съхранение на файловете паметта
 const upload = multer({ storage: multer.memoryStorage() });
 
-// 1. Създаване на ново задание (от админ панела)
-app.post('/api/assignments', async (req, res) => {
-  const { title, description } = req.body;
-  const { data, error } = await supabase
-    .from('assignments')
-    .insert([{ title, description }])
-    .select();
+// 1. Създаване на ново задание с възможност за прикачване на еталонен файл/Word
+app.post('/api/assignments', upload.single('referenceFile'), async (req, res) => {
+  try {
+    const { title, description } = req.body;
+    let reference_file_url = null;
 
-  if (error) return res.status(400).json({ error: error.message });
-  res.json(data[0]);
+    if (req.file) {
+      const fileName = `ref_${Date.now()}_${req.file.originalname}`;
+      const { error: storageError } = await supabase.storage
+        .from('student-code')
+        .upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
+
+      if (!storageError) {
+        const { data: publicUrlData } = supabase.storage.from('student-code').getPublicUrl(fileName);
+        reference_file_url = publicUrlData.publicUrl;
+      }
+    }
+
+    const { data, error } = await supabase
+      .from('assignments')
+      .insert([{ title, description, reference_file_url }])
+      .select();
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// 2. Вземане на всички задания (за админа)
+// 2. Вземане на всички задания
 app.get('/api/assignments', async (req, res) => {
   const { data, error } = await supabase.from('assignments').select('*').order('created_at', { ascending: false });
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
 });
 
-// 3. Вземане на конкретно задание по ID (за ученика)
+// 3. Вземане на конкретно задание по ID
 app.get('/api/assignments/:id', async (req, res) => {
   const { data, error } = await supabase.from('assignments').select('*').eq('id', req.params.id).single();
   if (error) return res.status(404).json({ error: 'Заданието не е намерено' });
   res.json(data);
 });
 
-// 4. Ученическо качване на решение
+// 4. Ученическо качване на решение (.cs или .zip)
 app.post('/api/submit', upload.single('codeFile'), async (req, res) => {
   try {
     const { assignment_id, student_name } = req.body;
@@ -48,7 +63,6 @@ app.post('/api/submit', upload.single('codeFile'), async (req, res) => {
 
     if (!file) return res.status(400).json({ error: 'Моля, прикачете файл с код.' });
 
-    // Качване на файла в Supabase Storage (в bucket-а "student-code")
     const fileName = `${Date.now()}_${file.originalname}`;
     const { data: storageData, error: storageError } = await supabase.storage
       .from('student-code')
@@ -56,10 +70,8 @@ app.post('/api/submit', upload.single('codeFile'), async (req, res) => {
 
     if (storageError) throw storageError;
 
-    // Взимане на публичен линк към файла
     const { data: publicUrlData } = supabase.storage.from('student-code').getPublicUrl(fileName);
 
-    // Запис в таблицата с предадени материали
     const { data, error: dbError } = await supabase
       .from('submissions')
       .insert([{
@@ -79,18 +91,18 @@ app.post('/api/submit', upload.single('codeFile'), async (req, res) => {
   }
 });
 
-// 5. Вземане на предадените материали за админ панела
+// 5. Вземане на предадените материали
 app.get('/api/submissions', async (req, res) => {
   const { data, error } = await supabase
     .from('submissions')
-    .select('*, assignments(title)')
+    .select('*, assignments(title, reference_file_url)')
     .order('submitted_at', { ascending: false });
 
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
 });
 
-// 6. Поставяне на оценка и точки от учителя
+// 6. Поставяне на оценка и точки
 app.patch('/api/submissions/:id', async (req, res) => {
   const { grade, points } = req.body;
   const { data, error } = await supabase
